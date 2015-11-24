@@ -1,3 +1,4 @@
 # Gitignore -- fullstack-tournament
 .vagrant
 .idea
+*.pyc

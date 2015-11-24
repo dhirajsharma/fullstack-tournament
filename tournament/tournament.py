@@ -5,8 +5,22 @@
 
 import psycopg2
 
+
+# Exception which is raised when trying to register a new player into a
+# tournament that has already begun playing.
 class CheaterException(Exception):
     pass
+
+# Exception raised when you try to get pairings for a tournament that has
+# no more remaining rounds.
+class NoMoreTournamentRounds(Exception):
+    pass
+
+# When information is asked to be found that doesn't make sense to the current
+# tournament, player or round.
+class TournamentMixupWarning(Warning):
+    pass
+
 
 class Current_Tournament:
     """
@@ -14,17 +28,59 @@ class Current_Tournament:
     in python. Basically it simply keeps a reference to a created tournament and
     makes that available
     """
-    tournament = None;
+    tournament = None
 
     def get_tournament(self):
+        """Return the current tournament id or create new tournament"""
         if self.tournament is None:
             self.tournament = create_tournament()
         return self.tournament
 
-    def get_round(self):
-        pass
+    def tournament_info(self, tournament_id=None):
+        """Get a tuple showing (number players, matches played, rounds left)"""
+        if tournament_id is None:
+            tournament_id = self.get_tournament()
+
+        c = connect().cursor()
+        c.execute("""
+        select player_count, match_count, active from
+        tournament_info where tournament_id = %s""", (tournament_id,))
+        row = c.fetchone()
+        if len(row) < 3:
+            raise Exception
+        commit(c)
+        return int(row[0]), int(row[1]), bool(row[2])
 
 
+def tournament_from_player(player_id):
+    """Get the tournament id from player id"""
+    c = connect().cursor()
+    try:
+        c.execute("""
+        select tournament_id from players where player_id = %s""", (player_id,))
+        row = c.fetchone()
+        tournament_id = int(row[0])
+    except psycopg2.DataError:
+        tournament_id = None
+    return tournament_id
+
+
+def opponent_from_player(player_id):
+    """Get the opponent id from the player id passed in for current round"""
+    tournament_id = tournament_from_player(player_id)
+    if tournament_id is None:
+        raise CheaterException
+    pairings = swiss_pairings(tournament_id)
+    if not len(pairings) > 0:
+        return False
+    for pair in pairings:
+        if pair[0] == player_id:
+            return pair[2]
+        if pair[2] == player_id:
+            return pair[0]
+
+    # Raise Warning because user is passing weird info, could be mistake
+    raise TournamentMixupWarning
 
 
 def create_tournament():
@@ -32,8 +88,7 @@ def create_tournament():
     c.execute("""
     insert into tournaments (opened) values (null) returning tournament_id""")
     tournament_id = c.fetchone()[0]
-    commit()
-    c.close()
+    commit(c)
     return int(tournament_id)
 
 
@@ -50,13 +105,13 @@ def connect():
     else:
         return psycopg2.connect('dbname=tournament')
 
-#        except psycopg2.Error as e:
-#            return 'Error Code: ', e.pgerror
 
-
-def commit():
+def commit(cursor=None):
+    """Commit the current data and close a cursor if passed in"""
     if globals().has_key('dbconnection'):
         dbconnection.commit()
+        if cursor is not None:
+            cursor.close()
     else:
         raise Exception('It is good to commit, but there\'s no connection!')
 
@@ -74,8 +129,7 @@ def delete_matches(tournament_id = None):
     else:
         c.execute("""delete from matches where tournament_id = %s"""
                   % (tournament_id,))
-    commit()
-    c.close()
+    commit(c)
 
 
 def delete_players(tournament_id = None):
@@ -91,8 +145,7 @@ def delete_players(tournament_id = None):
     else:
         c.execute("""delete from players where tournament_id = %s"""
                   % (tournament_id,))
-    commit()
-    c.close()
+    commit(c)
 
 
 def count_players(tournament_id = None):
@@ -111,8 +164,7 @@ def count_players(tournament_id = None):
         c.execute("""select count(*) from players where tournament_id = %d"""
                   % (tournament_id,))
     count = int(c.fetchone()[0])
-    commit()
-    c.close()
+    commit(c)
     return count
 
 
@@ -132,29 +184,33 @@ def register_player(player_name, tournament_id = None):
     # first we need to find an open tournament to register the player into
 
     if tournament_id is None or type(tournament_id) != int:
-        tournament_id = globals()['the_tournament'].get_tournament()
-    else:
-        # We will use the tournament passed in by user, but first we'll check
-        # because we can't allow registration into tournaments which have
-        # begun already.
-        c.execute(
-            """select count(*) from matches where tournament_id = %s"""
-            % (tournament_id,))
-        if int(c.fetchone()[0]) > 0:
-            raise CheaterException
+        tournament_id = globals()['tournaments'].get_tournament()
+
+    # We will use the tournament passed in by user, but first we'll check
+    # because we can't allow registration into tournaments which have
+    # begun already.
+    c.execute(
+        """select count(*) from matches where tournament_id = %s"""
+        % (tournament_id,))
+    if int(c.fetchone()[0]) > 0:
+        raise CheaterException
 
     # insert player into tournament
     c.execute("""
     insert into players (player_name, tournament_id) values (%s, %s) returning player_id""", (player_name, tournament_id))
     player_id = int(c.fetchone()[0])
-    commit()
-    c.close()
+    commit(c)
     return player_id
 
 
 def player_standings(tournament_id=None):
     """Returns a list of the players and their win records, sorted by wins.
     :arg tourney_id int - optional, the tournament that you want standings from
+
+    If you pass no argument or None as tournament_id then you will get results
+    of the current tournament. If you pass the 'all' as the tournament_id then
+    you will get player standings from the entire database. Throughout all
+    tournaments
 
     The first entry in the list should be the player in first place, or a player
     tied for first place if there is currently a tie.
@@ -167,37 +223,41 @@ def player_standings(tournament_id=None):
         matches: the number of matches the player has played
     """
     c = connect().cursor()
-    if tournament_id is not None:
+    if tournament_id == 'all':
+        c.execute("""
+        select player_id, player_name, (select count(*) from matches
+        where winner = player_id) as wins,
+        (select count(*) from matches where winner = player_id
+        or loser = player_id) as matches
+        from players order by wins desc""", (tournament_id,))
+    else:
+        if tournament_id is None:
+            tournament_id = tournaments.get_tournament()
+
         # Get specific Tournament id
         c.execute("""
-        select player_id, player_name, (select count(*) from matches where winner = player_id)
-        as wins,
-        (select count(*) from matches where winner = player_id or loser = player_id)
-        as matches
-        from players where tournament_id = %s order by wins desc""", (tournament_id,))
-        rows = c.fetchall()
-    else:
-        # We get all standings regardless of Tournament id
-        c.execute("""
-        select player_id, player_name, (select count(*) from matches where winner = player_id) as wins,
-        (select count(*) from matches where winner = player_id or loser = player_id)
-        as matches from players order by wins desc""")
-        rows = c.fetchall()
+        select player_id, player_name, (select count(*) from matches
+        where winner = player_id) as wins,
+        (select count(*) from matches where winner = player_id
+        or loser = player_id) as matches
+        from players where tournament_id = %s order by wins desc"""
+                  , (tournament_id,))
 
+    rows = c.fetchall()
     # Commit standings and close connection.
-    commit()
-    c.close()
+    commit(c)
     # Return the players standings
     return list((r[0], r[1], int(r[2]), int(r[3])) for r in rows)
 
 
-def report_match(winner, loser=None):
+def report_match(winner, opponent=None):
     """Records the outcome of a single match between two players.
 
     Args:
       winner:  the id number of the player who won
       loser:  the id number of the player who lost
     """
+     # We can use the opponent_from_player to figure out who the loser should be
     c = connect().cursor()
     c.execute("""
     -- Get the tournament id of match using id of winner in sub-query.
@@ -208,7 +268,7 @@ def report_match(winner, loser=None):
          (select tournament_id from players where player_id = %s),
          %s,
          %s) -- returning winner, loser""",
-              (winner, winner, loser))
+              (winner, winner, opponent))
     try:
         rows = c.fetchall()
         # Print out the match information to console.
@@ -220,8 +280,7 @@ def report_match(winner, loser=None):
         pass
 
     # Commit the round and close connection.
-    commit()
-    c.close()
+    commit(c)
  
  
 def swiss_pairings(tourney_id=None):
@@ -240,23 +299,21 @@ def swiss_pairings(tourney_id=None):
         name2: the second player's name
     """
     c = connect().cursor()
-    # We need to know what tournament the players are in
+    # If not tournament_id was passed in then we need to solve for it
     if tourney_id is None:
-        # The code review asks to find runing tournament_id through calculation
-        # rather than storing the id in the sql. Since only 1 tournament will
-        # run at a time I have a python class to manage the tournament_id
-        tournament_id = the_tournament.get_tournament()
+        tournament_id = tournaments.get_tournament()
     else:
         tournament_id = tourney_id
 
-    c.execute("""
-        select count(*) from matches where tournament_id = %s
-    """, (tournament_id,))
-    # We get the matches, because we can't swiss pair without having wins/loses
-    matches_this_tourney = int(c.fetchone()[0])
+
+    players, matches_played, active = tournaments.tournament_info(tournament_id)
+    # We get the tournament status so that we know if this tournament can pair
+    if not active:
+        raise NoMoreTournamentRounds
+
     #TODO: Make sure that we haven't exceeded the amount of logical rounds.
     # If matches are 0, then there's no rank, we can arbitrarily match players
-    if matches_this_tourney > 0:
+    if matches_played > 0:
         c.execute("""
         select player_id, player_name,
         round(
@@ -282,8 +339,7 @@ def swiss_pairings(tourney_id=None):
             pairs.append((rows[i][0], rows[i][1], None, 'Bye This Round'))
 
     # return the pairs of freshly matched players
-    c.close()
-    commit()
+    commit(c)
     return unique_swiss_pairings(pairs, tournament_id)
 
 
@@ -373,4 +429,4 @@ def unique_swiss_pairings(pairs, tournament_id, passes=0):
 dbconnection = connect()
 
 # This will manage the id of the current tournament.
-the_tournament = Current_Tournament()
+tournaments = Current_Tournament()
